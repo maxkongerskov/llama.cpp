@@ -63,6 +63,15 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
         case GGML_TYPE_IQ3_S:
             mul_mat_q_case<GGML_TYPE_IQ3_S, GGML_PREC_Q8>(ctx, args, stream);
             break;
+        case GGML_TYPE_IQ1_XS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ1_XXS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XXS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            mul_mat_q_case<GGML_TYPE_IQ1_XXXS, GGML_PREC_Q8>(ctx, args, stream);
+            break;
         case GGML_TYPE_IQ4_XS:
             mul_mat_q_case<GGML_TYPE_IQ4_XS, GGML_PREC_Q8>(ctx, args, stream);
             break;
@@ -186,21 +195,10 @@ void ggml_cuda_mul_mat_q(
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
-    int J_best        = 0;
-    int nthreads_best = 0;
-    {
-        int64_t ncols_opt = ne11;
-        if (ids) {
-            const int64_t n_expert_used = ids->ne[0];
-            ncols_opt = ne12;
-
-            // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
-                ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
-            }
-        }
-
+    // the tile width with the fewest tiles for ncols_opt columns, the smallest such one
+    auto pick_J = [&](const int64_t ncols_opt, int & J_best, int & nthreads_best) {
+        J_best        = 0;
+        nthreads_best = 0;
         int ntiles_J_best = INT_MAX;
 
         for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
@@ -221,6 +219,34 @@ void ggml_cuda_mul_mat_q(
                 ntiles_J_best = ntiles_x;
             }
         }
+    };
+
+    int J_best        = 0;
+    int nthreads_best = 0;
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
+
+        // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
+        const int64_t ncols_expert = (ne12*n_expert_used + ne02 - 1) / ne02;
+
+        if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
+            pick_J(ncols_expert, J_best, nthreads_best);
+        } else {
+            pick_J(ne12, J_best, nthreads_best);
+
+            // prefer the tile width for the average expert if it gets the compact MoE tiling
+            int J_expert        = 0;
+            int nthreads_expert = 0;
+            pick_J(ncols_expert, J_expert, nthreads_expert);
+            if (J_expert > 0 &&
+                    mmq_moe_compact_ntx(ne12*n_expert_used, ne12, ne02, J_expert) > 0) {
+                J_best        = J_expert;
+                nthreads_best = nthreads_expert;
+            }
+        }
+    } else {
+        pick_J(ne11, J_best, nthreads_best);
     }
     GGML_ASSERT(J_best > 0);
 
@@ -294,7 +320,7 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+        ggml_cuda_launch_mm_ids_helper(ctx.pool(), (const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
             ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -380,6 +406,9 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ1_XS:
+        case GGML_TYPE_IQ1_XXS:
+        case GGML_TYPE_IQ1_XXXS:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
 // -------------------------------------------------

@@ -17,6 +17,17 @@ struct clip_graph_siglip : clip_graph {
     ggml_cgraph * build() override;
 };
 
+struct clip_graph_inkling : clip_graph {
+    clip_graph_inkling(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+    ggml_tensor * build_mm(ggml_tensor * w, ggml_tensor * x) const override;
+    bool support_batch() const override { return true; }
+
+private:
+    ggml_cgraph * build_vision();
+    ggml_cgraph * build_audio();
+};
+
 struct clip_graph_gemma4v : clip_graph {
     clip_graph_gemma4v(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
@@ -425,6 +436,13 @@ struct clip_graph_kimik25 : clip_graph {
 struct clip_graph_parakeet : clip_graph {
     clip_graph_parakeet(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
     ggml_cgraph * build() override;
+};
+
+struct clip_graph_kimik3 : clip_graph {
+    clip_graph_kimik3(clip_ctx * ctx, const clip_image_f32 & img) : clip_graph(ctx, img) {}
+    ggml_cgraph * build() override;
+
+    ggml_tensor * resize_position_embeddings_3d(uint32_t interpolation_mode);
 };
 
 struct clip_graph_exaone4_5 : clip_graph {

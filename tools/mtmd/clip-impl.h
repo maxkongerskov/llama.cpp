@@ -384,6 +384,13 @@
 #define TN_A_FFN_POST_NORM   "%s.blk.%d.ffn_post_norm.%s"
 #define TN_A_FFN_POST_NORM_1 "%s.blk.%d.ffn_post_norm_1.%s"
 
+// Inkling hMLP vision and dMel audio towers.
+#define TN_INKLING_HMLP_LINEAR     "v.hmlp.%d.linear.weight"
+#define TN_INKLING_HMLP_NORM       "v.hmlp.%d.norm.weight"
+#define TN_INKLING_HMLP_FINAL_NORM "v.hmlp.final_norm.weight"
+#define TN_INKLING_DMEL_EMBD       "a.dmel.embedding.weight"
+#define TN_INKLING_DMEL_FINAL_NORM "a.dmel.final_norm.weight"
+
 // mobilenetv5 (gemma3n) definitions
 #define TN_MNV5_STEM_CONV        "v.conv_stem.conv.weight"
 #define TN_MNV5_STEM_BIAS        "v.conv_stem.conv.bias"
@@ -466,6 +473,7 @@ struct clip_enc_state {
 struct clip_ctx;
 
 enum projector_type {
+    PROJECTOR_TYPE_INKLING,
     PROJECTOR_TYPE_MLP,
     PROJECTOR_TYPE_MLP_NORM,
     PROJECTOR_TYPE_LDP,
@@ -511,6 +519,7 @@ enum projector_type {
     PROJECTOR_TYPE_DEEPSEEKOCR,
     PROJECTOR_TYPE_DEEPSEEKOCR2,
     PROJECTOR_TYPE_DEEPSEEK4V,
+    PROJECTOR_TYPE_DEEPSEEK41V,
     PROJECTOR_TYPE_LFM2A,
     PROJECTOR_TYPE_D1OMNI_A,
     PROJECTOR_TYPE_GLM4V,
@@ -518,6 +527,7 @@ enum projector_type {
     PROJECTOR_TYPE_YOUTUVL,
     PROJECTOR_TYPE_YASA2,
     PROJECTOR_TYPE_KIMIK25,
+    PROJECTOR_TYPE_KIMIK3,
     PROJECTOR_TYPE_NEMOTRON_V2_VL,
     PROJECTOR_TYPE_NEMOTRON_OMNI,
     PROJECTOR_TYPE_HUNYUANVL,
@@ -541,6 +551,7 @@ enum projector_type {
 };
 
 static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
+    { PROJECTOR_TYPE_INKLING,           "inkling" },
     { PROJECTOR_TYPE_MLP,               "mlp" },
     { PROJECTOR_TYPE_LDP,               "ldp" },
     { PROJECTOR_TYPE_LDPV2,             "ldpv2"},
@@ -585,6 +596,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_DEEPSEEKOCR,       "deepseekocr"},
     { PROJECTOR_TYPE_DEEPSEEKOCR2,      "deepseekocr2"},
     { PROJECTOR_TYPE_DEEPSEEK4V,        "deepseek4v"},
+    { PROJECTOR_TYPE_DEEPSEEK41V,       "deepseek41v"},
     { PROJECTOR_TYPE_LFM2A,             "lfm2a"},
     { PROJECTOR_TYPE_D1OMNI_A,          "d1omni_a"},
     { PROJECTOR_TYPE_GLM4V,             "glm4v"},
@@ -592,6 +604,7 @@ static std::map<projector_type, std::string> PROJECTOR_TYPE_NAMES = {
     { PROJECTOR_TYPE_YOUTUVL,           "youtuvl"},
     { PROJECTOR_TYPE_YASA2,             "yasa2"},
     { PROJECTOR_TYPE_KIMIK25,           "kimik25"},
+    { PROJECTOR_TYPE_KIMIK3,            "kimik3"},
     { PROJECTOR_TYPE_NEMOTRON_V2_VL,    "nemotron_v2_vl"},
     { PROJECTOR_TYPE_NEMOTRON_OMNI,     "nemotron_omni"},
     { PROJECTOR_TYPE_EXAONE4_5,         "exaone4_5"},
@@ -618,6 +631,9 @@ static projector_type clip_projector_type_from_string(const std::string & str) {
         if (pair.second == str) {
             return pair.first;
         }
+    }
+    if (str == "glm5next") { // pre-upstream converter
+        return PROJECTOR_TYPE_GLM5V;
     }
     return PROJECTOR_TYPE_UNKNOWN;
 }
@@ -853,6 +869,11 @@ static inline void clip_anyres_unpad(int cur_w, int cur_h, int orig_w, int orig_
         off_x = (cur_w - new_w) / 2;
         out_w = cur_w - 2 * off_x;
     }
+}
+
+// deepseek41v: [START] ([IMAGE]*n_llm_w [NEWLINE])*n_llm_h [END], ref: num_image_tokens() in image_processor.py
+static inline int dsv41_n_block_tokens(int n_llm_w, int n_llm_h) {
+    return n_llm_h * (n_llm_w + 1) + 2;
 }
 
 // deepseek4v: layout of the LLM token block built from the aligner grid

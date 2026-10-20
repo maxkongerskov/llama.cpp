@@ -187,6 +187,12 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         n_head  = 8;
         n_ff    = 1024;
         n_layer = 4;
+    } else if (arch == LLM_ARCH_DEEPSEEK41) {
+        // window-only, Engram, ratio-2 and ratio-1 sources, top-k reuse and a candidate-masked index layer
+        n_embd  = 512;
+        n_head  = 8;
+        n_ff    = 1024;
+        n_layer = 6;
     } else if (arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_LAGUNA) {
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
@@ -277,11 +283,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(1) : n_head_kv);
+        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) ? uint32_t(1) : n_head_kv);
     }
 
     ms.add_kv(LLM_KV_ATTENTION_MAX_ALIBI_BIAS, 8.0f);
-    if (arch == LLM_ARCH_DEEPSEEK4) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) {
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,   n_embd_head);
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH, n_embd_head);
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,   n_embd_head/2);
@@ -326,7 +332,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,      1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_EPS,          1e-5f);
     ms.add_kv(LLM_KV_ATTENTION_GROUPNORM_GROUPS,       uint32_t(8));
-    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            arch == LLM_ARCH_DEEPSEEK4 ? uint32_t(64) : uint32_t(512));
+    ms.add_kv(LLM_KV_ATTENTION_Q_LORA_RANK,            (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_DEEPSEEK41) ? uint32_t(64) : uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK,           uint32_t(512));
     ms.add_kv(LLM_KV_ATTENTION_RELATIVE_BUCKETS_COUNT, uint32_t(8));
     ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW,         n_ctx/8);
@@ -462,6 +468,39 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
     }
 
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,          uint32_t(8));
+        ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,            uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS,             std::vector<uint32_t>({0, 0, 2, 2, 1, 1}));
+        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE,     160000.0f);
+        ms.add_kv(LLM_KV_ATTENTION_KV_SOURCE_LAYERS,            std::vector<uint32_t>({2, 4}));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_SOURCE_LAYERS,       std::vector<uint32_t>({2, 4, 5}));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, int32_t(4));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOP_K_BLOCKS, uint32_t(4096));
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,   uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_COUNT,                uint32_t(4));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,  uint32_t(2));
+        ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,              1.0e-6f);
+        ms.add_kv(LLM_KV_HASH_LAYER_COUNT,                      uint32_t(0));
+        ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,                      10.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,                  1.0f);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_NORM,                   true);
+        std::vector<int32_t> token_map(n_vocab);
+        for (uint32_t i = 0; i < n_vocab; ++i) {
+            token_map[i] = (int32_t) (i % 61);
+        }
+        ms.add_kv(LLM_KV_PLE_LAYERS,                   std::vector<uint32_t>({1, 3}));
+        ms.add_kv(LLM_KV_PLE_NGRAM_SIZE,               uint32_t(3));
+        ms.add_kv(LLM_KV_PLE_HEADS_PER_NGRAM,          uint32_t(2));
+        ms.add_kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER,   uint32_t(64));
+        ms.add_kv(LLM_KV_PLE_LAYER_MULTIPLIERS,        std::vector<uint64_t>({ 76632096046245ull, 4839876093313ull, 35959672319349ull,
+                                                                               67716810739261ull, 51510806800915ull, 30921347202721ull }));
+        ms.add_kv(LLM_KV_PLE_HEAD_OFFSETS,             std::vector<uint64_t>({0, 101, 204, 311, 420, 533, 660, 791}));
+        ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,         std::vector<uint64_t>({101, 103, 107, 109, 113, 127, 131, 137}));
+        ms.add_kv(LLM_KV_ENGRAM_PAD_TOKEN_ID,          uint32_t(2));
+        ms.add_kv(LLM_KV_ENGRAM_TOKEN_MAP,             token_map);
+    }
+
     if (arch == LLM_ARCH_HRM_TEXT) {
         // 6 cache slots alias 2 physical blocks: 1 low-stack layer + 1 high-stack layer
         ms.add_kv(LLM_KV_HRM_LAYERS_PER_STACK, uint32_t(1));
@@ -505,6 +544,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
                 gating_func = 1;
                 break;
             case LLM_ARCH_DEEPSEEK4:
+            case LLM_ARCH_DEEPSEEK41:
                 gating_func = 4;
                 break;
             default:
@@ -552,6 +592,40 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     if (arch == LLM_ARCH_BAILINGMOE3) {
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_EXP,   std::vector<float>({0.0f, 4.0f}));
         ms.add_kv(LLM_KV_SWIGLU_CLAMP_SHEXP, std::vector<float>({0.0f, 5.0f}));
+    }
+    if (arch == LLM_ARCH_INKLING) {
+        // Read unconditionally by llama_model_inkling::load_arch_hparams, which
+        // then GGML_ASSERTs shortconv_kernel > 1, d_rel > 0, both rel extents > 0
+        // and logit_scale_denom != 0, so none of these can be left out.
+        ms.add_kv(LLM_KV_INKLING_D_REL,               uint32_t(16));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT,          uint32_t(8));
+        ms.add_kv(LLM_KV_INKLING_REL_EXTENT_SWA,      uint32_t(4));
+        ms.add_kv(LLM_KV_INKLING_SHORTCONV_KERNEL,    uint32_t(3));
+        ms.add_kv(LLM_KV_INKLING_DENSE_BLOCK_COUNT,   uint32_t(1));
+        ms.add_kv(LLM_KV_INKLING_LOGIT_SCALE_DENOM,   16.0f);
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_N_FLOOR, uint32_t(n_ctx));
+        ms.add_kv(LLM_KV_INKLING_LOG_SCALING_ALPHA,   0.0f);
+        ms.add_kv(LLM_KV_INKLING_UNPADDED_VOCAB_SIZE, n_vocab);
+        ms.add_kv(LLM_KV_EXPERT_WEIGHTS_SCALE,        1.0f);
+    }
+    if (arch == LLM_ARCH_DIFFUSION_GEMMA) {
+        // ISWA: the loader reads the SWA head lengths unconditionally, and they
+        // are separate keys from the non-SWA pair above.
+        ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   n_embd/n_head);
+        ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, n_embd/n_head);
+        // canvas_length splits the forward at P = n_tokens - canvas_length and
+        // the loader rejects anything <= 0. Kept well under the 128 tokens the
+        // backend comparison decodes, so both halves of that split are exercised.
+        ms.add_kv(LLM_KV_DIFFUSION_CANVAS_LENGTH, uint32_t(16));
+        // diffusion-gemma needs a mix: with every layer sliding, the non-SWA mask
+        // is built and used by nothing, so ggml-alloc never gives it a buffer and
+        // set_input dereferences a null one. A real model has both kinds of layer.
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back(il % 2);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     }
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,               n_embd/n_head);
     ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,           uint32_t(3));
@@ -752,6 +826,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_QWEN3NEXT:
         case LLM_ARCH_QWEN3VLMOE:
         case LLM_ARCH_QWEN35MOE:
+        case LLM_ARCH_INKLING:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_PHIMOE:
         case LLM_ARCH_DBRX:
@@ -761,7 +836,9 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_DEEPSEEK2:
         case LLM_ARCH_DEEPSEEK32:
         case LLM_ARCH_DOTS3NOTE:
+        case LLM_ARCH_DIFFUSION_GEMMA:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_DEEPSEEK41:
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_EXAONE_MOE:
@@ -1059,7 +1136,10 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
             continue;
         }
 
-        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
+        // diffusion-gemma belongs here for the same reason as the other diffusion
+        // decoders: it sets causal_attn = false, so the whole batch is one
+        // encoder pass and n_ubatch must not be capped below n_tokens.
+        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1 || arch == LLM_ARCH_DIFFUSION_GEMMA;
         for (bool moe : {false, true}) {
             if (moe && !moe_implemented(arch)) {
                 continue;

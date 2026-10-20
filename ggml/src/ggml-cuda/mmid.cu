@@ -23,6 +23,14 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
 template <int n> struct mm_ids_pow2 { static constexpr int value = 2*mm_ids_pow2<(n + 1)/2>::value; };
 template <>      struct mm_ids_pow2<1> { static constexpr int value = 1; };
 template <>      struct mm_ids_pow2<0> { static constexpr int value = 1; };
+// HIP has no __syncwarp; the kernels that use this run one warp per block, so __syncthreads is equivalent
+static __device__ __forceinline__ void mm_ids_warp_sync() {
+#ifdef GGML_USE_HIP
+    __syncthreads();
+#else
+    __syncwarp();
+#endif // GGML_USE_HIP
+}
 
 // Helper function for mul_mat_id, converts ids to a more convenient format.
 // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
@@ -147,33 +155,344 @@ static void launch_mm_ids_helper(
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
 }
 
-void ggml_cuda_launch_mm_ids_helper(
-        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
-        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
-    switch (n_expert_used) {
-        case  2:
-            launch_mm_ids_helper< 2>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case  4:
-            launch_mm_ids_helper< 4>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case  6:
-            launch_mm_ids_helper< 6>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case  8:
-            launch_mm_ids_helper< 8>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case 10:
-            launch_mm_ids_helper<10>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case 16:
-            launch_mm_ids_helper<16>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        case 32:
-            launch_mm_ids_helper<32>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
-        default:
-            launch_mm_ids_helper< 0>(ids, ids_src1, ids_dst, expert_bounds, n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);
-            break;
+// Stable counting sort: the same mapping as mm_ids_helper, with work proportional to the number of assignments instead of n_experts*n_tokens.
+
+#define MM_IDS_SCAN_BLOCK 256
+
+// per-block histogram over experts, block w owns tokens [w*tpb, min((w+1)*tpb, n_tokens))
+template <int n_expert_used_template>
+static __global__ void mm_ids_hist(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ hist,
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int si1,
+        const int tpb, const int W) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+
+    const int w   = blockIdx.x;
+    const int it0 = w*tpb;
+    const int it1 = min(it0 + tpb, n_tokens);
+
+    extern __shared__ char data_mm_ids_helper[];
+    int32_t * counts = (int32_t *) data_mm_ids_helper;
+
+    for (int e = threadIdx.x; e < n_experts; e += warp_size) {
+        counts[e] = 0;
+    }
+    mm_ids_warp_sync();
+
+    const int npairs = (it1 - it0)*n_expert_used;
+    for (int p = threadIdx.x; p < npairs; p += warp_size) {
+        const int itl = p / n_expert_used;
+        const int iex = p - itl*n_expert_used;
+        const int expert_used = ids[(size_t)(it0 + itl)*si1 + iex];
+        // skip out of range ids: expert_bounds[n_experts] then comes out short, which the caller checks
+        if (expert_used >= 0 && expert_used < n_experts) {
+            atomicAdd(&counts[expert_used], 1);
+        }
+    }
+    mm_ids_warp_sync();
+
+    for (int e = threadIdx.x; e < n_experts; e += warp_size) {
+        hist[(size_t) e*W + w] = counts[e];
     }
 }
+
+// Exclusive scan of each histogram row in place, plus the row total. One block per expert.
+static __global__ void mm_ids_scan_rows(
+        int32_t * __restrict__ hist, int32_t * __restrict__ row_total, const int W) {
+    int32_t * row = hist + (size_t) blockIdx.x*W;
+
+    __shared__ int32_t sdata[MM_IDS_SCAN_BLOCK];
+    __shared__ int32_t carry;
+
+    if (threadIdx.x == 0) {
+        carry = 0;
+    }
+    __syncthreads();
+
+    for (int base = 0; base < W; base += MM_IDS_SCAN_BLOCK) {
+        const int     i = base + threadIdx.x;
+        const int32_t v = i < W ? row[i] : 0;
+
+        sdata[threadIdx.x] = v;
+        __syncthreads();
+
+        for (int offset = 1; offset < MM_IDS_SCAN_BLOCK; offset <<= 1) {
+            const int32_t add = (int) threadIdx.x >= offset ? sdata[threadIdx.x - offset] : 0;
+            __syncthreads();
+            sdata[threadIdx.x] += add;
+            __syncthreads();
+        }
+
+        const int32_t inclusive  = sdata[threadIdx.x];
+        const int32_t base_carry = carry;
+        __syncthreads();
+
+        if (i < W) {
+            row[i] = base_carry + inclusive - v;
+        }
+        if (threadIdx.x == MM_IDS_SCAN_BLOCK - 1) {
+            carry = base_carry + inclusive;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        row_total[blockIdx.x] = carry;
+    }
+}
+
+// Exclusive scan of the per-expert totals into expert_bounds. Single block.
+static __global__ void mm_ids_expert_prefix(
+        const int32_t * __restrict__ row_total, int32_t * __restrict__ expert_bounds, const int n_experts) {
+    __shared__ int32_t sdata[MM_IDS_SCAN_BLOCK];
+    __shared__ int32_t carry;
+
+    if (threadIdx.x == 0) {
+        carry = 0;
+    }
+    __syncthreads();
+
+    for (int base = 0; base < n_experts; base += MM_IDS_SCAN_BLOCK) {
+        const int     i = base + threadIdx.x;
+        const int32_t v = i < n_experts ? row_total[i] : 0;
+
+        sdata[threadIdx.x] = v;
+        __syncthreads();
+
+        for (int offset = 1; offset < MM_IDS_SCAN_BLOCK; offset <<= 1) {
+            const int32_t add = (int) threadIdx.x >= offset ? sdata[threadIdx.x - offset] : 0;
+            __syncthreads();
+            sdata[threadIdx.x] += add;
+            __syncthreads();
+        }
+
+        const int32_t inclusive  = sdata[threadIdx.x];
+        const int32_t base_carry = carry;
+        __syncthreads();
+
+        if (i < n_experts) {
+            expert_bounds[i] = base_carry + inclusive - v;
+        }
+        if (threadIdx.x == MM_IDS_SCAN_BLOCK - 1) {
+            carry = base_carry + inclusive;
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        expert_bounds[n_experts] = carry;
+    }
+}
+
+// Stable scatter: block w writes its first assignment to expert e at expert_bounds[e] + hist[e][w].
+template <int n_expert_used_template>
+static __global__ void mm_ids_scatter(
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int32_t * __restrict__ hist,
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y,
+        const int si1, const int sis1, const bool write_inverse, const int tpb, const int W) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+
+    const int lane = threadIdx.x;
+    const int w    = blockIdx.x;
+    const int it0  = w*tpb;
+    const int it1  = min(it0 + tpb, n_tokens);
+
+    extern __shared__ char data_mm_ids_helper[];
+    int32_t * cursor = (int32_t *) data_mm_ids_helper;
+
+    for (int e = lane; e < n_experts; e += warp_size) {
+        cursor[e] = expert_bounds[e] + hist[(size_t) e*W + w];
+    }
+    mm_ids_warp_sync();
+
+    const int npairs = (it1 - it0)*n_expert_used;
+    for (int p0 = 0; p0 < npairs; p0 += warp_size) {
+        const int p = p0 + lane;
+
+        int expert_used = -1;
+        int it  = 0;
+        int iex = 0;
+        if (p < npairs) {
+            const int itl = p / n_expert_used;
+            iex = p - itl*n_expert_used;
+            it  = it0 + itl;
+            const int e = ids[(size_t) it*si1 + iex];
+            expert_used = e >= 0 && e < n_experts ? e : -1;
+        }
+
+        // rank by lane among lanes with the same expert: keeps the token-major, slot-minor order of mm_ids_helper
+        int rank = 0;
+        int cnt  = 0;
+#pragma unroll
+        for (int j = 0; j < warp_size; ++j) {
+            const int ej = __shfl_sync(0xFFFFFFFF, expert_used, j, warp_size);
+            if (ej == expert_used) {
+                cnt++;
+                rank += j < lane;
+            }
+        }
+
+        int pos = 0;
+        if (expert_used >= 0) {
+            pos = cursor[expert_used] + rank;
+        }
+        mm_ids_warp_sync(); // every lane has read its cursor before the leader advances it
+        if (expert_used >= 0 && rank == 0) {
+            cursor[expert_used] += cnt;
+        }
+        mm_ids_warp_sync();
+
+        if (expert_used >= 0) {
+            ids_dst[pos] = it*n_expert_used + iex;
+            // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+            if (write_inverse) {
+                ids_src1[it*n_expert_used + iex] = pos;
+            } else {
+                ids_src1[pos] = it*sis1 + iex % nchannels_y;
+            }
+        }
+    }
+}
+
+template <int n_expert_used_template>
+static void launch_mm_ids_counting_sort(
+        ggml_cuda_pool & pool,
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    const int id        = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[id].warp_size;
+    const int nsm       = ggml_cuda_info().devices[id].nsm;
+
+    // one warp per block over a contiguous token range; cap the block count to keep the histogram small
+    int tpb = 16;
+    int W   = (n_tokens + tpb - 1) / tpb;
+    const int max_W = 8*nsm;
+    while (W > max_W) {
+        tpb *= 2;
+        W    = (n_tokens + tpb - 1) / tpb;
+    }
+
+    ggml_cuda_pool_alloc<int32_t> hist(pool, (size_t) n_experts*W);
+    ggml_cuda_pool_alloc<int32_t> row_total(pool, n_experts);
+
+    const size_t nbytes_shared = (size_t) n_experts*sizeof(int32_t);
+
+    mm_ids_hist<n_expert_used_template><<<W, warp_size, nbytes_shared, stream>>>
+        (ids, hist.ptr, n_experts, n_tokens, n_expert_used_var, si1, tpb, W);
+    CUDA_CHECK(cudaGetLastError());
+
+    mm_ids_scan_rows<<<n_experts, MM_IDS_SCAN_BLOCK, 0, stream>>>(hist.ptr, row_total.ptr, W);
+    CUDA_CHECK(cudaGetLastError());
+
+    mm_ids_expert_prefix<<<1, MM_IDS_SCAN_BLOCK, 0, stream>>>(row_total.ptr, expert_bounds, n_experts);
+    CUDA_CHECK(cudaGetLastError());
+
+    mm_ids_scatter<n_expert_used_template><<<W, warp_size, nbytes_shared, stream>>>
+        (ids, ids_src1, ids_dst, expert_bounds, hist.ptr, n_experts, n_tokens, n_expert_used_var,
+         nchannels_y, si1, sis1, write_inverse, tpb, W);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+static bool mm_ids_counting_sort_possible(const int n_experts) {
+    const int id = ggml_cuda_get_device();
+    return (size_t) n_experts*sizeof(int32_t) <= ggml_cuda_info().devices[id].smpb;
+}
+
+static bool mm_ids_legacy_possible(const int n_tokens, const int n_expert_used) {
+    const int id = ggml_cuda_get_device();
+    return (size_t) n_tokens*sizeof(mm_ids_helper_store) <= ggml_cuda_info().devices[id].smpbo &&
+        n_tokens < (1 << 22) && n_expert_used < (1 << 10);
+}
+
+// GGML_CUDA_MM_IDS_SORT=0/1 forces the single-warp kernel/the counting sort, for testing
+static int mm_ids_sort_override() {
+    static const int value = []() {
+        const char * env = getenv("GGML_CUDA_MM_IDS_SORT");
+        return env ? atoi(env) : -1;
+    }();
+    return value;
+}
+
+// the counting sort needs 4 launches instead of 1, so use it only for large shapes or when the single-warp kernel cannot run
+static bool mm_ids_use_counting_sort(const int n_experts, const int n_tokens, const int n_expert_used) {
+    // an empty batch would launch an empty grid, the single-warp kernel writes the zero bounds instead
+    if (n_tokens == 0 || !mm_ids_counting_sort_possible(n_experts)) {
+        return false;
+    }
+    if (!mm_ids_legacy_possible(n_tokens, n_expert_used)) {
+        return true; // the single-warp kernel cannot run at all
+    }
+    const int forced = mm_ids_sort_override();
+    if (forced >= 0) {
+        return forced != 0;
+    }
+    return (int64_t) n_experts*n_tokens >= (1 << 16);
+}
+
+static __global__ void mm_ids_invert(
+        const int32_t * __restrict__ ids_dst, int32_t * __restrict__ ids_inverse, const int n) {
+    const int ic = blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (ic >= n) {
+        return;
+    }
+
+    // repeated ids leave holes with garbage in ids_dst on the single-warp path: skip them, no OOB write
+    const int32_t id = ids_dst[ic];
+    if (id < 0 || id >= n) {
+        return;
+    }
+
+    ids_inverse[id] = ic;
+}
+
+void ggml_cuda_launch_mm_ids_invert(
+        const int32_t * ids_dst, int32_t * ids_inverse, const int n, cudaStream_t stream) {
+    if (n <= 0) {
+        return;
+    }
+
+    const int block_size = 256;
+    const int num_blocks = (n + block_size - 1) / block_size;
+    mm_ids_invert<<<num_blocks, block_size, 0, stream>>>(ids_dst, ids_inverse, n);
+}
+
+// only the counting sort gives a complete permutation for repeated ids, the single-warp kernel leaves holes,
+// so the host sort keeps rejecting those for the shapes the counting sort is not used for
+bool ggml_cuda_mm_ids_helper_supported(const int n_experts, const int n_tokens, const int n_expert_used) {
+    return mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
+}
+
+#define MM_IDS_DISPATCH(neu)                                                                                                    \
+    do {                                                                                                                        \
+        if (counting_sort) {                                                                                                    \
+            launch_mm_ids_counting_sort<neu>(pool, ids, ids_src1, ids_dst, expert_bounds,                                       \
+                n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);                             \
+        } else {                                                                                                                \
+            launch_mm_ids_helper<neu>(ids, ids_src1, ids_dst, expert_bounds,                                                    \
+                n_experts, n_tokens, n_expert_used, nchannels_y, si1, sis1, write_inverse, stream);                             \
+        }                                                                                                                       \
+    } while (0)
+
+void ggml_cuda_launch_mm_ids_helper(
+        ggml_cuda_pool & pool,
+        const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+        const int n_experts, const int n_tokens, const int n_expert_used, const int nchannels_y, const int si1, const int sis1, const bool write_inverse, cudaStream_t stream) {
+    const bool counting_sort = mm_ids_use_counting_sort(n_experts, n_tokens, n_expert_used);
+
+    switch (n_expert_used) {
+        case  2: MM_IDS_DISPATCH( 2); break;
+        case  4: MM_IDS_DISPATCH( 4); break;
+        case  6: MM_IDS_DISPATCH( 6); break;
+        case  8: MM_IDS_DISPATCH( 8); break;
+        case 10: MM_IDS_DISPATCH(10); break;
+        case 16: MM_IDS_DISPATCH(16); break;
+        case 32: MM_IDS_DISPATCH(32); break;
+        default: MM_IDS_DISPATCH( 0); break;
+    }
+}
+
+#undef MM_IDS_DISPATCH

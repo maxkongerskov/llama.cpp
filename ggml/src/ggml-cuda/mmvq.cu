@@ -58,6 +58,9 @@ static constexpr __device__ vec_dot_q_cuda_t get_vec_dot_q_cuda(ggml_type type) 
         case GGML_TYPE_IQ2_S:   return vec_dot_iq2_s_q8_1;
         case GGML_TYPE_IQ3_XXS: return vec_dot_iq3_xxs_q8_1;
         case GGML_TYPE_IQ1_S:   return vec_dot_iq1_s_q8_1;
+        case GGML_TYPE_IQ1_XS:  return vec_dot_iq1_xs_q8_1;
+        case GGML_TYPE_IQ1_XXS: return vec_dot_iq1_xxs_q8_1;
+        case GGML_TYPE_IQ1_XXXS: return vec_dot_iq1_xxxs_q8_1;
         case GGML_TYPE_IQ1_M:   return vec_dot_iq1_m_q8_1;
         case GGML_TYPE_IQ4_NL:  return vec_dot_iq4_nl_q8_1;
         case GGML_TYPE_IQ4_XS:  return vec_dot_iq4_xs_q8_1;
@@ -150,6 +153,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_pascal_older(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 6;
+        case GGML_TYPE_IQ1_XS:  return 6;
+        case GGML_TYPE_IQ1_XXS: return 6;
+        case GGML_TYPE_IQ1_XXXS: return 6;
         case GGML_TYPE_IQ1_M:   return 6;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 5;
@@ -190,6 +196,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_turing_plus(ggm
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_gcn(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 5;
+        case GGML_TYPE_IQ1_XS:  return 5;
+        case GGML_TYPE_IQ1_XXS: return 5;
+        case GGML_TYPE_IQ1_XXXS: return 5;
         case GGML_TYPE_IQ1_M:   return 5;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -240,6 +249,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna1_rdna2(ggm
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 6;
+        case GGML_TYPE_IQ1_XS:  return 6;
+        case GGML_TYPE_IQ1_XXS: return 6;
+        case GGML_TYPE_IQ1_XXXS: return 6;
         case GGML_TYPE_IQ1_M:   return 6;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -258,6 +270,9 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna3(ggml_type
 static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type type) {
     switch (type) {
         case GGML_TYPE_IQ1_S:   return 7;
+        case GGML_TYPE_IQ1_XS:  return 7;
+        case GGML_TYPE_IQ1_XXS: return 7;
+        case GGML_TYPE_IQ1_XXXS: return 7;
         case GGML_TYPE_IQ1_M:   return 7;
         case GGML_TYPE_IQ2_S:   return 4;
         case GGML_TYPE_IQ2_XS:  return 4;
@@ -285,10 +300,12 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
 int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     // NVIDIA: P100, Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
-        if (cc == GGML_CUDA_CC_PASCAL || cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+        // Match get_mmvq_mmid_max_batch_for_device: key on the compiled arch, e.g. a P100 running 50-virtual PTX uses the pascal_older bounds.
+        const int arch = ggml_cuda_highest_compiled_arch(cc);
+        if (arch == GGML_CUDA_CC_PASCAL || arch == GGML_CUDA_CC_VOLTA || arch >= GGML_CUDA_CC_ADA_LOVELACE) {
             return MMVQ_MAX_BATCH_SIZE;
         }
-        if (cc >= GGML_CUDA_CC_TURING) {
+        if (arch >= GGML_CUDA_CC_TURING) {
             return get_mmvq_mmid_max_batch_turing_plus(type);
         }
         return get_mmvq_mmid_max_batch_pascal_older(type);
@@ -402,6 +419,9 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 case GGML_TYPE_Q6_K:
                     return ne11 <= 4;
                 case GGML_TYPE_IQ1_S:
+                case GGML_TYPE_IQ1_XS:
+                case GGML_TYPE_IQ1_XXS:
+                case GGML_TYPE_IQ1_XXXS:
                     return ne11 <= 5;
                 case GGML_TYPE_IQ2_XXS:
                 case GGML_TYPE_IQ3_S:
@@ -738,7 +758,7 @@ static __global__ void mul_mat_vec_q(
     float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int64_t kbx_offset = int64_t(sample_x)*stride_sample_x + int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row_x;
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
@@ -944,7 +964,7 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
-    const int kbx_offset  = channel_x*stride_channel_x + row0*stride_row_x;
+    const int64_t kbx_offset  = int64_t(channel_x)*stride_channel_x + int64_t(row0)*stride_row_x;
 
     // partial sum for each thread
     float tmp[c_rows_per_block] = {0.0f};
@@ -1149,9 +1169,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,
         };
-        constexpr std::array<ggml_type, 8> iq_slow_other = {
-            GGML_TYPE_IQ1_S, GGML_TYPE_IQ1_M,   GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
-            GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+        constexpr std::array<ggml_type, 11> iq_slow_other = {
+            GGML_TYPE_IQ1_S,   GGML_TYPE_IQ1_M,    GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+            GGML_TYPE_IQ2_S,   GGML_TYPE_IQ3_XXS,  GGML_TYPE_IQ3_S,   GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ1_XS,  GGML_TYPE_IQ1_XXS,  GGML_TYPE_IQ1_XXXS,
         };
         constexpr std::array<ggml_type, 3> slow_pascal = {
             GGML_TYPE_IQ3_S,
@@ -1419,6 +1440,24 @@ static void mul_mat_vec_q_switch_type(
             break;
         case GGML_TYPE_IQ1_S:
             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_S>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_IQ1_XS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XS>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_IQ1_XXS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XXS>
+                (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+            break;
+        case GGML_TYPE_IQ1_XXXS:
+            mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_XXXS>
                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);

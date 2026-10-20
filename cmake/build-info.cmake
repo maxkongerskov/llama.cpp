@@ -1,5 +1,5 @@
-set(BUILD_NUMBER 0)
-set(BUILD_COMMIT "unknown")
+set(BUILD_NUMBER 11724)
+set(BUILD_COMMIT "b19757490")
 set(BUILD_COMPILER "unknown")
 set(BUILD_TARGET "unknown")
 
@@ -46,3 +46,6 @@ if(CMAKE_VS_PLATFORM_NAME)
 else()
     set(BUILD_TARGET "${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}")
 endif()
+
+# Unsloth fingerprint: shows in --version and strings.
+set(BUILD_TARGET "${BUILD_TARGET} (Compiled by the Unsloth team)")

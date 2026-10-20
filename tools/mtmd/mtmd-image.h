@@ -26,6 +26,20 @@ struct mtmd_image_preproc_out {
     }
 };
 
+// Inkling hMLP preprocessing; pixel_values_bthwc is row-major BTHWC [n_patches, 2, 40, 40, 3].
+struct mtmd_inkling_image_preproc_out {
+    clip_image_size source_size;
+    clip_image_size resized_size;
+    int patch_rows = 0;
+    int patch_cols = 0;
+    std::vector<uint8_t> resized_rgb;
+    std::vector<float> pixel_values_bthwc;
+};
+
+mtmd_inkling_image_preproc_out mtmd_image_preprocess_inkling(
+        const clip_image_u8 & img,
+        resize_algo algo = RESIZE_ALGO_LANCZOS);
+
 // base class, models must inherit from this class
 struct mtmd_image_preprocessor {
     const clip_hparams & hparams;
@@ -126,6 +140,12 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
     mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
+// Inkling: split an image into 40x40 hMLP patches, each duplicated across a fixed temporal dimension of two.
+struct mtmd_image_preprocessor_inkling : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_inkling(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+};
+
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
 // if image_resize_pad is true, the resized image will be padded, otherwise it will be either stretched or center-cropped depending on image_resize_pad
 // this is used by models with native support for dynamic image size, for example: Qwen-VL, Pixtral, Kimi-VL, etc
@@ -161,6 +181,15 @@ private:
     static grid_info grid_tokens(int best_height, int best_width, int patch_size, int r);
     static void solve_resize_ratio(int height, int width, int p, int r, int max_n_token, int & best_height, int & best_width);
     static void safe_resize(int height, int width, int & best_height, int & best_width, int p, int r, int max_n_token);
+};
+
+// ref: inference/image_processor.py in the HF repo (DeepSeek-V4.1-Flash): plan_image_grid / load_image
+struct mtmd_image_preprocessor_deepseek41v : mtmd_image_preprocessor {
+    mtmd_image_preprocessor_deepseek41v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
+    // target pixel size (multiples of patch_size) for an image of the given size, exposed for tests
+    static void plan_grid(int width, int height, int p, int r, int max_n_token, int min_pixels,
+                          int & best_width, int & best_height);
 };
 
 // custom llava-uhd slicing logic for MiniCPM-V

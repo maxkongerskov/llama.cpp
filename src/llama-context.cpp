@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -248,6 +249,18 @@ llama_context::llama_context(
         }
     }
 
+    // not via ctx_other: for draft-mtp that means the draft shares the target's memory
+    cparams.model_tgt = nullptr;
+    // a vocab-only model has no tensors at all
+    if (!hparams.vocab_only && model.arch == LLM_ARCH_QWEN4EXP && (model.tok_embd == nullptr || model.output == nullptr)) {
+        const llama_model * tgt = params.ctx_other ? llama_get_model(params.ctx_other) : nullptr;
+        if (cparams.ctx_type != LLAMA_CONTEXT_TYPE_MTP || !tgt || !tgt->tok_embd || !tgt->output ||
+            tgt->hparams.n_embd != model.hparams.n_embd || tgt->vocab.n_tokens() != model.vocab.n_tokens()) {
+            throw std::runtime_error(model.arch_name() + " head without token_embd/output only works as an MTP draft (--spec-type draft-mtp) of a matching target (this warning is normal during memory fitting)");
+        }
+        cparams.model_tgt = tgt;
+    }
+
     if (cparams.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         cparams.rope_scaling_type = hparams.rope_scaling_type_train;
     }
@@ -424,6 +437,23 @@ llama_context::llama_context(
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
             backends.emplace_back(backend);
+        }
+
+        // a draft head that borrows the target's token_embd/output reads them where the target placed them,
+        // so the target's devices need a backend here even when the draft runs on other devices
+        if (cparams.model_tgt) {
+            for (const auto & dev : cparams.model_tgt->devices) {
+                const bool have = std::any_of(backends.begin(), backends.end(),
+                        [&](const ggml_backend_ptr & b) { return ggml_backend_get_device(b.get()) == dev.dev; });
+                if (have) {
+                    continue;
+                }
+                ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+                if (backend == nullptr) {
+                    throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
+                }
+                backends.emplace_back(backend);
+            }
         }
 
         // add ACCEL backends (such as BLAS)
@@ -1323,8 +1353,9 @@ void llama_context::set_abort_callback(bool (*abort_callback)(void * data), void
 void llama_context::set_embeddings(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
-    // a pooled context computes the logits only without embeddings, so the toggle changes the graph shape
-    if (cparams.embeddings != value && cparams.pooling_type != LLAMA_POOLING_TYPE_NONE) {
+    // the toggle changes the graph shape (pooled: logits only; pooling NONE: the reserve graph outputs all tokens,
+    // which crashed ggml_gallocr on the first /completion), so re-reserve on every toggle
+    if (cparams.embeddings != value) {
         sched_need_reserve = true;
     }
 
@@ -1596,8 +1627,14 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
     const int64_t n_vocab = model.vocab.n_tokens();
 
-    // note: during encode, we always output all tokens and skip position continuity checks (output_all=true)
-    if (!balloc->init(batch_inp, model.vocab, true)) {
+    // Memoryless models (e.g. canvas diffusion) route decode() here but often need logits for only a few rows
+    // (the canvas). When the caller caps n_outputs_max below the batch size, honor the per-token output flags
+    // instead of forcing every row, avoiding an [n_tokens, n_vocab] reserve (huge at a 262k vocab). The default
+    // n_outputs_max == n_batch >= n_tokens, so this is a no-op for encoder/embedding models.
+    const bool output_all = cparams.embeddings || cparams.n_outputs_max >= (uint32_t) batch_inp.tokens.size();
+
+    // note: during encode, we always pass the full sequence starting from pos = 0
+    if (!balloc->init(batch_inp, model.vocab, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1626,17 +1663,27 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     n_queued_tokens += n_tokens;
 
-    // reserve output buffer
-    if (output_reserve(n_tokens) < n_tokens) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_tokens);
+    // reserve output buffer (capped: only the flagged rows when output_all is false)
+    const uint32_t n_outputs_enc = output_all ? n_tokens : balloc->get_n_outputs();
+    if (output_reserve(n_outputs_enc) < n_outputs_enc) {
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %u outputs\n", __func__, n_outputs_enc);
         return -2;
     };
 
-    for (uint32_t i = 0; i < n_tokens; ++i) {
-        output_ids[i] = i;
+    std::fill(output_ids.begin(), output_ids.end(), -1);
+    if (output_all) {
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            output_ids[i] = i;
+        }
+    } else {
+        // map each flagged token index -> its output-buffer row (out_ids is sorted for canvas models)
+        const auto & out_ids = balloc->get_out_ids();
+        for (uint32_t i = 0; i < n_outputs_enc; ++i) {
+            output_ids[out_ids[i]] = i;
+        }
     }
 
-    n_outputs = n_tokens;
+    n_outputs = n_outputs_enc;
 
     const auto causal_attn_org = cparams.causal_attn;
 
@@ -1669,7 +1716,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         GGML_ASSERT(backend_res != nullptr);
         GGML_ASSERT(logits.data != nullptr);
 
-        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_tokens*n_vocab*sizeof(float));
+        ggml_backend_tensor_get_async(backend_res, t_logits, logits.data, 0, n_outputs_enc*n_vocab*sizeof(float));
     }
 
     // extract embeddings
@@ -2520,6 +2567,7 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||
         model.arch == LLM_ARCH_DEEPSEEK4 ||
+        model.arch == LLM_ARCH_DEEPSEEK41 ||
         (model.arch == LLM_ARCH_DFLASH && model.hparams.dsv4_hc_mult > 0) ||
         model.arch == LLM_ARCH_NANBEIGE ||
         model.arch == LLM_ARCH_MINIMAX_01 ||
@@ -4055,8 +4103,15 @@ llama_context * llama_init_from_model(
         }
     }
 
-    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4) && params.type_k != params.type_v) {
+    if ((model->hparams.is_mla() || model->arch == LLM_ARCH_DEEPSEEK4 || model->arch == LLM_ARCH_DEEPSEEK41) && params.type_k != params.type_v) {
         LLAMA_LOG_ERROR("%s: model does not support different K (%s) and V (%s) cache types\n", __func__, ggml_type_name(params.type_k), ggml_type_name(params.type_v));
+        return nullptr;
+    }
+
+    // quantized V forces the dense path, which transposes V - invalid for a block-quantized tensor
+    if (model->arch == LLM_ARCH_INKLING && ggml_is_quantized(params.type_v)) {
+        LLAMA_LOG_ERROR("%s: model does not support a quantized V cache (%s)\n",
+            __func__, ggml_type_name(params.type_v));
         return nullptr;
     }
 

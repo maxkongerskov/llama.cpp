@@ -956,6 +956,10 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
     std::unique_ptr<clip_graph> builder;
 
     switch (ctx->proj_type()) {
+        case PROJECTOR_TYPE_INKLING:
+            {
+                builder = std::make_unique<clip_graph_inkling>(ctx, img);
+            } break;
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_IDEFICS3:
         case PROJECTOR_TYPE_COHERE2V:
@@ -1080,8 +1084,13 @@ static std::unique_ptr<clip_graph> clip_get_graph_builder(clip_ctx * ctx, const 
                 builder = std::make_unique<clip_graph_kimik25>(ctx, img);
             } break;
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
             {
                 builder = std::make_unique<clip_graph_deepseek4v>(ctx, img);
+            } break;
+        case PROJECTOR_TYPE_KIMIK3:
+            {
+                builder = std::make_unique<clip_graph_kimik3>(ctx, img);
             } break;
         case PROJECTOR_TYPE_COGVLM:
             {
@@ -1464,6 +1473,21 @@ struct clip_model_loader {
 
             // model-specific params
             switch (model.proj_type) {
+                case PROJECTOR_TYPE_INKLING:
+                    {
+                        if (is_vision) {
+                            hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                            hparams.image_resize_pad  = PAD_NONE;
+                            hparams.warmup_image_size = hparams.patch_size;
+                        } else {
+                            hparams.audio_chunk_len   = 0;
+                            hparams.audio_sample_rate = 16000;
+                            hparams.audio_n_fft       = 1600;
+                            hparams.audio_window_len  = 1600;
+                            hparams.audio_hop_len     = 800;
+                            hparams.warmup_audio_size = 4;
+                        }
+                    } break;
                 case PROJECTOR_TYPE_MLP:
                 case PROJECTOR_TYPE_MLP_NORM:
                 case PROJECTOR_TYPE_LDP:
@@ -1709,6 +1733,47 @@ struct clip_model_loader {
                         const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
                         hparams.set_warmup_n_tokens(warmup_side * warmup_side);
                     } break;
+                case PROJECTOR_TYPE_DEEPSEEK41V:
+                    {
+                        // ref: load_image in inference/image_processor.py (V4.1), PIL ImageOps.pad on gray 127
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
+                        hparams.image_pad_color   = {127, 127, 127};
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge);
+                        get_u32(KEY_IMAGE_MIN_PIXELS,  hparams.image_min_pixels);
+                        // vision_max_n_token = 1024, vision_max_wh_ratio = null (converter asserts both)
+                        hparams.dsv4_max_n_token  = 1024;
+                        hparams.dsv4_max_wh_ratio = 0;
+                        const int patch_area = hparams.patch_size * hparams.patch_size * hparams.n_merge * hparams.n_merge;
+                        if (hparams.custom_image_min_tokens > 0) {
+                            hparams.image_min_pixels = hparams.custom_image_min_tokens * patch_area;
+                        }
+                        if (hparams.custom_image_max_tokens > 0) {
+                            // the cap is on the whole token block (newlines + start/end included)
+                            hparams.dsv4_max_n_token = std::max(hparams.custom_image_max_tokens, 16);
+                        }
+                        hparams.image_max_pixels = hparams.dsv4_max_n_token * patch_area;
+                        hparams.image_min_pixels = std::min(hparams.image_min_pixels, hparams.image_max_pixels);
+                        const int warmup_side = (int) std::sqrt((double) std::min(256, hparams.dsv4_max_n_token));
+                        hparams.set_warmup_n_tokens(warmup_side * warmup_side);
+                    } break;
+                case PROJECTOR_TYPE_KIMIK3:
+                    {
+                        hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
+                        hparams.rope_theta = 10000.0f;
+                        get_u32(KEY_PROJ_SCALE_FACTOR, hparams.n_merge, false);
+
+                        int min_pixels = 0, max_pixels = 0;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, min_pixels, false);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, max_pixels, false);
+                        if (min_pixels > 0 && max_pixels > 0) {
+                            hparams.image_min_pixels = min_pixels;
+                            hparams.image_max_pixels = max_pixels;
+                            hparams.warmup_image_size = static_cast<int>(std::sqrt(max_pixels));
+                        } else {
+                            hparams.set_limit_image_tokens(2, 4096);
+                        }
+                    } break;
                 case PROJECTOR_TYPE_GEMMA3:
                     {
                         // default value (used by all model sizes in gemma 3 family)
@@ -1891,9 +1956,13 @@ struct clip_model_loader {
                         hparams.n_merge = 2;
                         hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
-                        get_f32(KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
-                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels);
-                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels);
+                        // pre-upstream files: swiglu_limit, no pixel budget keys
+                        const bool legacy = gguf_find_key(ctx_gguf.get(), KEY_SWIGLU_CLAMP) < 0;
+                        get_f32(legacy ? "clip.vision.swiglu_limit" : KEY_SWIGLU_CLAMP, hparams.swiglu_clamp, true);
+                        hparams.image_min_pixels = 12544;
+                        hparams.image_max_pixels = 6272000;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, hparams.image_min_pixels, !legacy);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, hparams.image_max_pixels, !legacy);
                         hparams.set_limit_image_tokens();
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                     } break;
@@ -2400,6 +2469,7 @@ struct clip_model_loader {
 
         const bool has_standard_layers = (
             model.proj_type != PROJECTOR_TYPE_GEMMA3NV &&
+            model.proj_type != PROJECTOR_TYPE_INKLING &&
             model.proj_type != PROJECTOR_TYPE_QWEN3TTS_SPKENC &&
             model.proj_type != PROJECTOR_TYPE_POCKETTTS_GEN &&
             model.proj_type != PROJECTOR_TYPE_MUSE_SPARK_AUDIO);
@@ -2497,6 +2567,23 @@ struct clip_model_loader {
 
 
         switch (model.proj_type) {
+            case PROJECTOR_TYPE_INKLING:
+                {
+                    if (model.modality == CLIP_MODALITY_VISION) {
+                        model.inkling_hmlp_layers.resize(hparams.n_layer);
+                        for (int il = 0; il < hparams.n_layer; ++il) {
+                            auto & layer = model.inkling_hmlp_layers[il];
+                            layer.linear_w = get_tensor(string_format(TN_INKLING_HMLP_LINEAR, il));
+                            layer.norm_w = il + 1 < hparams.n_layer
+                                ? get_tensor(string_format(TN_INKLING_HMLP_NORM, il))
+                                : nullptr;
+                        }
+                        model.inkling_hmlp_final_norm_w = get_tensor(TN_INKLING_HMLP_FINAL_NORM);
+                    } else {
+                        model.inkling_dmel_embd_w       = get_tensor(TN_INKLING_DMEL_EMBD);
+                        model.inkling_dmel_final_norm_w = get_tensor(TN_INKLING_DMEL_FINAL_NORM);
+                    }
+                } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
                 {
@@ -2947,6 +3034,13 @@ struct clip_model_loader {
                     model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
                     model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
                 } break;
+            case PROJECTOR_TYPE_KIMIK3:
+                {
+                    // patchmergerv2, bias-free, norm after the projection
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_post_norm_w = get_tensor(string_format(TN_MM_POST_NORM, "weight"));
+                } break;
             case PROJECTOR_TYPE_KIMIVL:
             case PROJECTOR_TYPE_PADDLEOCR:
             case PROJECTOR_TYPE_KIMIK25:
@@ -2969,6 +3063,17 @@ struct clip_model_loader {
                     model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
                     model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
                     model.token_embd_img_pad   = get_tensor(TN_TOK_IMG_PAD);
+                } break;
+            case PROJECTOR_TYPE_DEEPSEEK41V:
+                {
+                    model.mm_1_w = get_tensor(string_format(TN_LLAVA_PROJ, 1, "weight"));
+                    model.mm_1_b = get_tensor(string_format(TN_LLAVA_PROJ, 1, "bias"));
+                    model.mm_2_w = get_tensor(string_format(TN_LLAVA_PROJ, 2, "weight"));
+                    model.mm_2_b = get_tensor(string_format(TN_LLAVA_PROJ, 2, "bias"));
+                    // image_start / image_end / image_newline, written into the output block
+                    model.image_newline        = get_tensor(TN_IMAGE_NEWLINE);
+                    model.token_embd_img_start = get_tensor(TN_TOK_IMG_START);
+                    model.token_embd_img_end   = get_tensor(TN_TOK_IMG_END);
                 } break;
             case PROJECTOR_TYPE_PIXTRAL:
                 {
@@ -3905,6 +4010,11 @@ struct clip_model_loader {
             LOG_INF("%s: warmup with audio size = %d\n", __func__, hparams.warmup_audio_size);
         }
         batch.entries.push_back(img);
+        // One logical Inkling vision patch always contains two adjacent temporal slices (including warmup reserve).
+        if (ctx_clip.model.modality == CLIP_MODALITY_VISION &&
+                ctx_clip.model.proj_type == PROJECTOR_TYPE_INKLING) {
+            batch.entries.push_back(img);
+        }
         return batch;
     }
 
@@ -4251,7 +4361,7 @@ struct clip_cap clip_get_cap(const char * fname) {
 
 int clip_get_image_max_tokens(const clip_ctx * ctx) {
     const auto & hparams = ctx->model.hparams;
-    if (ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK4V) {
+    if (ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK4V || ctx->proj_type() == PROJECTOR_TYPE_DEEPSEEK41V) {
         return hparams.dsv4_max_n_token;
     }
     if (hparams.image_max_pixels <= 0) {
@@ -4340,6 +4450,16 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
     projector_type proj = ctx->proj_type();
 
     switch (proj) {
+        case PROJECTOR_TYPE_INKLING:
+            {
+                if (ctx->model.modality == CLIP_MODALITY_AUDIO) {
+                    // One dMel row is one soft audio token.
+                    n_patches = img->nx();
+                } else {
+                    // Batch entries are temporal slices; each pair emits one token.
+                    n_patches = 1;
+                }
+            } break;
         case PROJECTOR_TYPE_MLP:
         case PROJECTOR_TYPE_MLP_NORM:
         case PROJECTOR_TYPE_JANUS_PRO:
@@ -4439,6 +4559,7 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
         case PROJECTOR_TYPE_D1OMNI_V:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
             {
                 // dynamic size
                 int out_patch_size = params.patch_size * ctx->model.hparams.n_merge;
@@ -4452,6 +4573,13 @@ int clip_n_output_tokens(const clip_ctx * ctx, const clip_image_f32 * img) {
                 const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
                 const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
                 n_patches = dsv4_get_block_layout(n_llm_w, n_llm_h, img->lead_pad).n_out;
+            } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
+            {
+                const int out_patch_size = params.patch_size * params.n_merge;
+                const int n_llm_w = CLIP_ALIGN(img->nx(), out_patch_size) / out_patch_size;
+                const int n_llm_h = CLIP_ALIGN(img->ny(), out_patch_size) / out_patch_size;
+                n_patches = dsv41_n_block_tokens(n_llm_w, n_llm_h);
             } break;
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_DOTS_OCR:
@@ -5431,6 +5559,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_PIXTRAL:
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
         case PROJECTOR_TYPE_LIGHTONOCR:
             {
                 // set the 2D positions
@@ -5497,6 +5626,34 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                     idx.push_back(idx_pad);
                 }
                 idx.push_back(idx_end);
+                set_input_i32("layout_idx", idx);
+            } break;
+        case PROJECTOR_TYPE_DEEPSEEK41V:
+            {
+                // mrope layout, only the first 2 channels are used
+                const int n_patches_per_row = image_size_width / patch_size;
+                std::vector<int32_t> positions(n_pos * 4, 0);
+                for (int i = 0; i < n_pos; i++) {
+                    positions[i]         = i / n_patches_per_row;
+                    positions[n_pos + i] = i % n_patches_per_row;
+                }
+                set_input_i32("positions", positions);
+
+                // reading-order block: rows [0, n_grid) are the aligner output, then start / end / newline
+                const int n_merge = hparams.n_merge;
+                const int n_llm_w = CLIP_ALIGN(pos_w, n_merge) / n_merge;
+                const int n_llm_h = CLIP_ALIGN(pos_h, n_merge) / n_merge;
+                const int n_grid  = n_llm_w * n_llm_h;
+                std::vector<int32_t> idx;
+                idx.reserve(dsv41_n_block_tokens(n_llm_w, n_llm_h));
+                idx.push_back(n_grid);         // IMAGE_START
+                for (int r = 0; r < n_llm_h; r++) {
+                    for (int c = 0; c < n_llm_w; c++) {
+                        idx.push_back(r * n_llm_w + c);
+                    }
+                    idx.push_back(n_grid + 2); // IMAGE_NEW_LINE
+                }
+                idx.push_back(n_grid + 1);     // IMAGE_END
                 set_input_i32("layout_idx", idx);
             } break;
         case PROJECTOR_TYPE_GLM_EDGE:
@@ -5626,6 +5783,7 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         case PROJECTOR_TYPE_GEMMA3:
         case PROJECTOR_TYPE_GEMMA3NV:
         case PROJECTOR_TYPE_IDEFICS3:
+        case PROJECTOR_TYPE_INKLING: // inp_raw is the only graph input
         case PROJECTOR_TYPE_COHERE2V:
         case PROJECTOR_TYPE_INTERNVL:
         case PROJECTOR_TYPE_NEMOTRON_V2_VL:
@@ -6308,6 +6466,10 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
 int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
     switch (ctx->model.proj_type) {
+        case PROJECTOR_TYPE_INKLING:
+            return ctx->model.modality == CLIP_MODALITY_AUDIO
+                ? ctx->model.inkling_dmel_final_norm_w->ne[0]
+                : ctx->model.inkling_hmlp_final_norm_w->ne[0];
         case PROJECTOR_TYPE_LDP:
             return ctx->model.mm_model_block_1_block_2_1_b->ne[0];
         case PROJECTOR_TYPE_LDPV2:
@@ -6382,8 +6544,10 @@ int clip_n_mmproj_embd(const struct clip_ctx * ctx) {
         case PROJECTOR_TYPE_KIMIVL:
         case PROJECTOR_TYPE_PADDLEOCR:
         case PROJECTOR_TYPE_KIMIK25:
+        case PROJECTOR_TYPE_KIMIK3:
         case PROJECTOR_TYPE_YASA2:
         case PROJECTOR_TYPE_DEEPSEEK4V:
+        case PROJECTOR_TYPE_DEEPSEEK41V:
         case PROJECTOR_TYPE_COHERE2V:
             return ctx->model.mm_2_w->ne[1];
         case PROJECTOR_TYPE_HUNYUANVL:

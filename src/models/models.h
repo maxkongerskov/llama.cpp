@@ -944,6 +944,66 @@ struct llama_model_gemma4 : public llama_model_base {
 };
 
 
+struct llama_model_diffusion_gemma : public llama_model_base {
+    llama_model_diffusion_gemma(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // canvas occupies the last canvas_length positions of the batch; everything before is the prompt
+    uint32_t canvas_length = 0;
+
+    // self-conditioning per-request state (set via llama_diffusion_set_sc before llama_decode). sc_enabled
+    // false = byte-identical to zero-SC; sc_use is a {0,1} gate (a block's first step uses 0); sc_logits_ptr
+    // is [n_vocab * C] host logits, the graph applies softmax(sc_logits * sc_temp_inv).
+    mutable const float * sc_logits_ptr = nullptr;
+    mutable float         sc_use        = 0.0f;
+    mutable float         sc_temp_inv   = 1.0f;
+    mutable bool          sc_enabled    = false;
+
+    // self-conditioning soft embedding: embed_tokens transposed to [n_vocab, n_embd] F16 in a device
+    // weights buffer (per-step matmul stays on-device). Built lazily on first use, freed in the destructor.
+    mutable ggml_tensor         * sc_embT     = nullptr;  // [n_vocab, n_embd] F16 (embed_tokens transposed)
+    mutable ggml_context        * sc_embT_ctx = nullptr;
+    mutable ggml_backend_buffer_t sc_embT_buf = nullptr;
+
+    // device-resident self-conditioning (opt-in via llama_diffusion_set_device_sc): keep the prev step's
+    // raw canvas logits in sc_dev (device) and read SC from it instead of a per-step 268 MB host upload.
+    // Bit-identical to the host path (same F32 logits); single-device, like the PKV store.
+    mutable bool                  sc_device_resident = false;
+    mutable ggml_tensor         * sc_dev      = nullptr;  // [n_vocab, sc_dev_C] F32 prev-step canvas logits
+    mutable ggml_context        * sc_dev_ctx  = nullptr;
+    mutable ggml_backend_buffer_t sc_dev_buf  = nullptr;
+    mutable int64_t               sc_dev_C    = 0;        // allocated canvas capacity (grow-only)
+
+    // prompt KV caching: the prompt's per-layer K,V are step-invariant, so compute once per block and
+    // reuse across denoising steps instead of recomputing the whole [prompt|canvas] forward.
+    //   PKV_UNIFIED : no-cache forward over [prompt|canvas] (default + safety fallback).
+    //   PKV_PREFILL : forward a chunk of the prompt; write its per-layer K,V into the store at pkv_prefill_off.
+    //   PKV_DECODE  : forward the canvas only; read the cached prompt K,V.
+    // Store is device-resident (in pkv_buf/pkv_ctx), allocated lazily from the PREFILL graph; element type
+    // follows flash-attn (F16 under FA - precision-neutral since FA casts K,V to F16 anyway - else F32).
+    enum pkv_phase_t { PKV_UNIFIED = 0, PKV_PREFILL = 1, PKV_DECODE = 2 };
+    mutable pkv_phase_t pkv_phase = PKV_UNIFIED;
+    mutable int64_t     pkv_P     = 0;   // prompt length of the current block
+    mutable int64_t     pkv_prefill_off = 0;   // PREFILL: global start position of the current prompt chunk
+    mutable int64_t     pkv_cap   = 0;   // allocated capacity (max P) of the store
+    mutable std::vector<ggml_tensor *> pkv_k;   // per layer [n_embd_head_k(il), n_head_kv(il), pkv_cap]
+    mutable std::vector<ggml_tensor *> pkv_v;
+    mutable ggml_context        * pkv_ctx = nullptr;
+    mutable ggml_backend_buffer_t pkv_buf = nullptr;
+
+    ~llama_model_diffusion_gemma() override;
+
+    struct graph : public llm_graph_context {
+        const llama_model & model;
+
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_gemma4_assistant : public llama_model_base {
     llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1283,6 +1343,15 @@ struct llama_model_dots3note : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+// YaRN attention factor that cancels ggml's rope mscale (the DeepSeek-V4 reference applies none)
+static inline float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
+    if (ext_factor == 0.0f) {
+        return 1.0f;
+    }
+
+    return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
+}
+
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1310,6 +1379,17 @@ struct llama_model_deepseek4 : public llama_model_base {
                 ggml_tensor ** post,
                 ggml_tensor ** comb,
                 int il) const;
+
+        // returns the pre weights and fills post / comb
+        ggml_tensor * build_hc_mixes(
+                ggml_tensor * x,
+                ggml_tensor * hc_fn,
+                ggml_tensor * hc_scale,
+                ggml_tensor * hc_base,
+                ggml_tensor ** post,
+                ggml_tensor ** comb,
+                int il,
+                bool f32_src = false) const;
 
         ggml_tensor * build_hc_post(
                 ggml_tensor * x,
@@ -1425,6 +1505,63 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
+struct llama_model_deepseek41 : public llama_model_deepseek4 {
+    llama_model_deepseek41(const struct llama_model_params & params) : llama_model_deepseek4(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    // Engram hash constants, hashed on the host (ggml has no int64 mul/xor/mod)
+    std::vector<int32_t>  engram_layers;
+    uint32_t engram_max_ngram = 0;
+    uint32_t engram_n_head    = 0;
+    uint32_t engram_head_dim  = 0;
+    uint32_t engram_pad_id    = 0;
+    std::vector<int32_t>  engram_token_map;
+    std::vector<uint64_t> engram_mult;
+    std::vector<uint64_t> engram_primes;
+    std::vector<uint64_t> engram_offsets; // first row of each (layer, order, head) in per_layer_token_embd
+
+    int engram_index(int il) const;
+    uint32_t engram_n_cols() const { return (engram_max_ngram - 1)*engram_n_head; }
+
+    void engram_hash(int e, const llama_ubatch & ubatch, const std::vector<llama_token> & prev, std::vector<int32_t> & out) const;
+
+    struct graph : public llama_model_deepseek4::graph {
+        graph(const llama_model & model, const llm_graph_params & params);
+        // helpers only (no graph built): base of graph_dsv41
+        explicit graph(const llm_graph_params & params) : llama_model_deepseek4::graph(params) {}
+
+        ggml_tensor * build_engram(
+                const llama_model_deepseek41 & model,
+                ggml_tensor * x,
+                ggml_tensor * ids,
+                ggml_tensor * keep,
+                int il) const;
+
+        ggml_tensor * build_attention41(
+                const llama_model_deepseek41 & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                ggml_tensor * cand_pin,
+                int il);
+
+        std::vector<ggml_tensor *> topk_of; // top-k of each index source layer
+        std::vector<ggml_tensor *> comp_row_of; // [n_layer] new compressed rows of each kv source (for mirrors)
+        ggml_tensor * cand_sel    = nullptr; // candidate blocks of the candidate source layer
+        int64_t       cand_n_comp = 0;       // compressed rows the candidate source scored
+
+        // sparse path (LLAMA_DSV41_SPARSE=0 disables): fused indexer, FA bounded to window + top-k, decode gather
+        bool sparse = true;
+        // gather path, shared by layers with the same top-k: selected K rows per (storage layer, top-k source) and
+        // the mask per top-k source (one input copy per split)
+        std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
+        std::map<int32_t, ggml_tensor *> gather_mask_of;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
 struct llama_model_deepseek2ocr : public llama_model_base {
     llama_model_deepseek2ocr(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1482,6 +1619,11 @@ struct llama_model_dflash : public llama_model_base {
 
     struct graph_dsv4 : public llama_model_deepseek4::graph {
         graph_dsv4(const llama_model & model, const llm_graph_params & params);
+    };
+
+    // DeepSeek-V4.1 DSpark: single-pass mHC (lagged pre-mix, no hc_head), no per-head q norm
+    struct graph_dsv41 : public llama_model_deepseek41::graph {
+        graph_dsv41(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2290,6 +2432,19 @@ struct llama_model_lfm2moe : public llama_model_base {
 
     template <bool iswa>
     using graph = llama_model_lfm2::graph<iswa>;
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
+struct llama_model_inkling : public llama_model_base {
+    llama_model_inkling(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_graph_context {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };

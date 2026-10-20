@@ -192,6 +192,9 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // active cell count when position p lives in physical cell p; 0 for any non-contiguous layout
+    uint32_t get_n_kv_pos_contiguous(const slot_info & sinfo, const llama_ubatch & ubatch) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -236,6 +239,10 @@ public:
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
+    // inkling: fill dst I32 [n_kv, n_tokens] with flat rel-bias gather indices,
+    // idx(i, j) = i*(extent + 1) + rel; empty/out-of-band cells map to the zero-bias column `extent`
+    void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
+
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
@@ -249,6 +256,9 @@ public:
     //   prev, n=2: A -> [NULL, NULL], B -> [NULL, A], 3rd X -> [X, X], C -> [X, X]
     // note: used by n-gram input embeddings
     void get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const;
+
+    // token of seq_id at the largest cached position <= p, LLAMA_TOKEN_NULL if none or no cell ext
+    llama_token seq_pos_tok_le(llama_seq_id seq_id, llama_pos p) const;
 
 private:
     const llama_model & model;
@@ -399,6 +409,7 @@ public:
     //
 
     uint32_t get_n_kv() const;
+    uint32_t get_n_kv_pos_contiguous() const;
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -431,6 +442,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_pos_rel_flat(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const; // inkling
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -441,8 +453,8 @@ public:
 private:
     llama_memory_status status;
 
-    llama_kv_cache * kv;
-    llama_context * lctx;
+    llama_kv_cache * kv = nullptr;
+    llama_context * lctx = nullptr;
 
     //
     // update context

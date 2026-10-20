@@ -430,7 +430,14 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_MXFP8   = 43, // MXFP8 (E4M3, E8M0 scale), gather-only
+        // IQ1_S's 8-element ternary codebook with a narrower index; see ggml-common.h.
+        // 42..63 stay reserved for upstream (42 is already Q2_0), so fork-local types start
+        // at 64 and a stock build rejects these files instead of misreading them.
+        GGML_TYPE_IQ1_XS   = 64, // 1.4375 bpw, 1024-entry grid
+        GGML_TYPE_IQ1_XXS  = 65, // 1.3125 bpw,  512-entry grid
+        GGML_TYPE_IQ1_XXXS = 66, // 1.1875 bpw,  256-entry grid
+        GGML_TYPE_COUNT   = 67,
     };
 
     // [TAG_GGML_PREC]
@@ -443,6 +450,10 @@ extern "C" {
     enum ggml_prec {
         GGML_PREC_UNDEFINED = 0,
         GGML_PREC_DEFAULT   = 0,  // note: deprecated, use GGML_PREC_UNDEFINED
+        // stricter than F32: true IEEE F32 arithmetic, no TF32 / tensor-core / reassociating
+        // shortcuts (cuBLAS pedantic mode). Ranks below GGML_PREC_F32 so that
+        // "at least F32" tests (prec != UNDEFINED && prec <= GGML_PREC_F32) accept it.
+        GGML_PREC_F32_PEDANTIC = 5,
         GGML_PREC_F32       = 10,
         GGML_PREC_BF16      = 15,
         GGML_PREC_F16       = 20,
@@ -486,6 +497,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        // 28..39 are reserved for upstream ggml, which is already using 28 for Q2_0.
+        GGML_FTYPE_MOSTLY_IQ1_XS   = 40, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXS  = 41, // except 1d tensors
+        GGML_FTYPE_MOSTLY_IQ1_XXXS = 42, // except 1d tensors
     };
 
     // available tensor operations:
@@ -569,6 +584,7 @@ extern "C" {
         GGML_OP_FILL,
 
         GGML_OP_FLASH_ATTN_EXT,
+        GGML_OP_FLASH_ATTN_EXT_BANDED,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
         GGML_OP_SSM_SCAN,
@@ -2498,6 +2514,19 @@ extern "C" {
             float                 scale,
             float                 max_bias,
             float                 logit_softcap);
+
+    // flash attention with an additive banded relative-position bias, applied after scale, no dense bias tensor:
+    //   rel_logits: [rel_extent, n_head, n_batch, ne3]; rel_dist = q_idx + (n_kv - n_batch) - kv_idx
+    //   score += rel_logits[rel_dist, head, q_idx, batch] iff 0 <= rel_dist < rel_extent
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel_logits,
+            float                 scale,
+            int64_t               rel_extent);
 
     GGML_DEPRECATED(GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
